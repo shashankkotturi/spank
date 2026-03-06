@@ -23,6 +23,7 @@ import (
 
 	"github.com/charmbracelet/fang"
 	"github.com/gopxl/beep/v2"
+	"github.com/gopxl/beep/v2/effects"
 	"github.com/gopxl/beep/v2/mp3"
 	"github.com/gopxl/beep/v2/speaker"
 	"github.com/spf13/cobra"
@@ -50,9 +51,10 @@ var (
 	fastMode     bool
 	minAmplitude float64
 	cooldownMs   int
-	stdioMode    bool
-	paused       bool
-	pausedMu     sync.RWMutex
+	stdioMode      bool
+	volumeScaling  bool
+	paused         bool
+	pausedMu       sync.RWMutex
 )
 
 // sensorReady is closed once shared memory is created and the sensor
@@ -253,6 +255,7 @@ Use --halo to play random audio clips from Halo soundtracks on each slap.`,
 	cmd.Flags().Float64Var(&minAmplitude, "min-amplitude", defaultMinAmplitude, "Minimum amplitude threshold (0.0-1.0, lower = more sensitive)")
 	cmd.Flags().IntVar(&cooldownMs, "cooldown", defaultCooldownMs, "Cooldown between responses in milliseconds")
 	cmd.Flags().BoolVar(&stdioMode, "stdio", false, "Enable stdio mode: JSON output and stdin commands (for GUI integration)")
+	cmd.Flags().BoolVar(&volumeScaling, "volume-scaling", false, "Scale playback volume by slap amplitude (harder hits = louder)")
 
 	if err := fang.Execute(context.Background(), cmd); err != nil {
 		os.Exit(1)
@@ -446,13 +449,46 @@ func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuf
 		} else {
 			fmt.Printf("slap #%d [%s amp=%.5fg] -> %s\n", num, ev.Severity, ev.Amplitude, file)
 		}
-		go playAudio(pack, file, &speakerInit)
+		go playAudio(pack, file, ev.Amplitude, &speakerInit)
 	}
 }
 
 var speakerMu sync.Mutex
 
-func playAudio(pack *soundPack, path string, speakerInit *bool) {
+// amplitudeToVolume maps a detected amplitude to a beep/effects.Volume
+// level. Amplitude typically ranges from ~0.05 (light tap) to ~1.0+
+// (hard slap). The mapping uses a logarithmic curve so that light taps
+// are noticeably quieter and hard hits play near full volume.
+//
+// Returns a value in the range [-3.0, 0.0] for use with effects.Volume
+// (base 2): -3.0 is ~1/8 volume, 0.0 is full volume.
+func amplitudeToVolume(amplitude float64) float64 {
+	const (
+		minAmp   = 0.05  // softest detectable
+		maxAmp   = 0.80  // treat anything above this as max
+		minVol   = -3.0  // quietest playback (1/8 volume with base 2)
+		maxVol   = 0.0   // full volume
+	)
+
+	// Clamp
+	if amplitude <= minAmp {
+		return minVol
+	}
+	if amplitude >= maxAmp {
+		return maxVol
+	}
+
+	// Normalize to [0, 1]
+	t := (amplitude - minAmp) / (maxAmp - minAmp)
+
+	// Log curve for more natural volume scaling
+	// log(1 + t*99) / log(100) maps [0,1] -> [0,1] with a log curve
+	t = math.Log(1+t*99) / math.Log(100)
+
+	return minVol + t*(maxVol-minVol)
+}
+
+func playAudio(pack *soundPack, path string, amplitude float64, speakerInit *bool) {
 	var streamer beep.StreamSeekCloser
 	var format beep.Format
 
@@ -489,8 +525,19 @@ func playAudio(pack *soundPack, path string, speakerInit *bool) {
 	}
 	speakerMu.Unlock()
 
+	// Optionally scale volume based on slap amplitude
+	var source beep.Streamer = streamer
+	if volumeScaling {
+		source = &effects.Volume{
+			Streamer: streamer,
+			Base:     2,
+			Volume:   amplitudeToVolume(amplitude),
+			Silent:   false,
+		}
+	}
+
 	done := make(chan bool)
-	speaker.Play(beep.Seq(streamer, beep.Callback(func() {
+	speaker.Play(beep.Seq(source, beep.Callback(func() {
 		done <- true
 	})))
 	<-done
@@ -551,12 +598,17 @@ func processCommands(r io.Reader, w io.Writer) {
 			if stdioMode {
 				fmt.Fprintf(w, `{"status":"settings_updated","amplitude":%.4f,"cooldown":%d}%s`, minAmplitude, cooldownMs, "\n")
 			}
+		case "volume-scaling":
+			volumeScaling = !volumeScaling
+			if stdioMode {
+				fmt.Fprintf(w, `{"status":"volume_scaling_toggled","volume_scaling":%t}%s`, volumeScaling, "\n")
+			}
 		case "status":
 			pausedMu.RLock()
 			isPaused := paused
 			pausedMu.RUnlock()
 			if stdioMode {
-				fmt.Fprintf(w, `{"status":"ok","paused":%t,"amplitude":%.4f,"cooldown":%d}%s`, isPaused, minAmplitude, cooldownMs, "\n")
+				fmt.Fprintf(w, `{"status":"ok","paused":%t,"amplitude":%.4f,"cooldown":%d,"volume_scaling":%t}%s`, isPaused, minAmplitude, cooldownMs, volumeScaling, "\n")
 			}
 		default:
 			if stdioMode {

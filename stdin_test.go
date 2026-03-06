@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 )
@@ -15,6 +16,7 @@ func resetGlobals() {
 	minAmplitude = 0.05
 	cooldownMs = 750
 	stdioMode = true
+	volumeScaling = false
 }
 
 func TestPauseCommand(t *testing.T) {
@@ -178,6 +180,41 @@ func TestSetAmplitudeOutOfRange(t *testing.T) {
 	}
 }
 
+func TestVolumeScalingCommand(t *testing.T) {
+	resetGlobals()
+
+	// Toggle on
+	input := `{"cmd":"volume-scaling"}` + "\n"
+	var output bytes.Buffer
+	processCommands(strings.NewReader(input), &output)
+
+	if !volumeScaling {
+		t.Error("expected volumeScaling to be true after toggle")
+	}
+
+	var resp struct {
+		Status        string `json:"status"`
+		VolumeScaling bool   `json:"volume_scaling"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if resp.Status != "volume_scaling_toggled" {
+		t.Errorf("expected status 'volume_scaling_toggled', got %q", resp.Status)
+	}
+	if !resp.VolumeScaling {
+		t.Error("expected volume_scaling true in response")
+	}
+
+	// Toggle off
+	output.Reset()
+	processCommands(strings.NewReader(input), &output)
+
+	if volumeScaling {
+		t.Error("expected volumeScaling to be false after second toggle")
+	}
+}
+
 func TestStatusCommand(t *testing.T) {
 	resetGlobals()
 	minAmplitude = 0.1
@@ -189,10 +226,11 @@ func TestStatusCommand(t *testing.T) {
 	processCommands(strings.NewReader(input), &output)
 
 	var resp struct {
-		Status    string  `json:"status"`
-		Paused    bool    `json:"paused"`
-		Amplitude float64 `json:"amplitude"`
-		Cooldown  int     `json:"cooldown"`
+		Status        string  `json:"status"`
+		Paused        bool    `json:"paused"`
+		Amplitude     float64 `json:"amplitude"`
+		Cooldown      int     `json:"cooldown"`
+		VolumeScaling bool    `json:"volume_scaling"`
 	}
 	if err := json.Unmarshal(output.Bytes(), &resp); err != nil {
 		t.Fatalf("failed to parse response: %v", err)
@@ -208,6 +246,9 @@ func TestStatusCommand(t *testing.T) {
 	}
 	if resp.Cooldown != 600 {
 		t.Errorf("expected cooldown 600, got %d", resp.Cooldown)
+	}
+	if resp.VolumeScaling != false {
+		t.Errorf("expected volume_scaling false, got %t", resp.VolumeScaling)
 	}
 }
 
@@ -335,6 +376,51 @@ func TestMultipleCommands(t *testing.T) {
 	json.Unmarshal([]byte(lines[3]), &resp4)
 	if resp4.Paused {
 		t.Error("line 4: expected paused=false")
+	}
+}
+
+func TestAmplitudeToVolume(t *testing.T) {
+	tests := []struct {
+		name      string
+		amplitude float64
+		wantMin   float64
+		wantMax   float64
+	}{
+		{"below minimum returns min volume", 0.01, -3.0, -3.0},
+		{"at minimum returns min volume", 0.05, -3.0, -3.0},
+		{"above maximum returns max volume", 1.0, 0.0, 0.0},
+		{"at maximum returns max volume", 0.80, 0.0, 0.0},
+		{"mid amplitude returns mid-range", 0.40, -2.0, -0.5},
+		{"low amplitude is quieter than high", 0.10, -3.0, -1.5},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := amplitudeToVolume(tt.amplitude)
+			if got < tt.wantMin || got > tt.wantMax {
+				t.Errorf("amplitudeToVolume(%f) = %f, want in [%f, %f]",
+					tt.amplitude, got, tt.wantMin, tt.wantMax)
+			}
+		})
+	}
+
+	// Monotonicity: higher amplitude should yield higher (or equal) volume
+	prev := amplitudeToVolume(0.05)
+	for amp := 0.10; amp <= 0.80; amp += 0.05 {
+		cur := amplitudeToVolume(amp)
+		if cur < prev-1e-9 {
+			t.Errorf("non-monotonic: amplitudeToVolume(%f)=%f < amplitudeToVolume(prev)=%f",
+				amp, cur, prev)
+		}
+		prev = cur
+	}
+
+	// Verify no NaN or Inf
+	for _, amp := range []float64{0, 0.05, 0.1, 0.5, 0.8, 1.0, 10.0} {
+		v := amplitudeToVolume(amp)
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			t.Errorf("amplitudeToVolume(%f) returned %f", amp, v)
+		}
 	}
 }
 
