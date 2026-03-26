@@ -18,7 +18,7 @@ Uses the Apple Silicon accelerometer (Bosch BMI286 IMU via IOKit HID) to detect 
 
 ## Requirements
 
-- macOS on Apple Silicon (M2+)
+- macOS on Apple Silicon (any M-series chip M2 or greater, or the M1 Pro SKU specifically, no other M1/A-series chips!)
 - `sudo` (for IOKit HID accelerometer access)
 - Go 1.26+ (if building from source)
 
