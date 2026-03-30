@@ -10,6 +10,7 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"os/exec"
 	"io"
 	"math"
 	"math/rand"
@@ -43,13 +44,15 @@ var sexyAudio embed.FS
 //go:embed audio/halo/*.mp3
 var haloAudio embed.FS
 
-//go:embed audio/lizard/*.mp3
-var lizardAudio embed.FS
+//go:embed audio/meme/*.mp3
+var memeAudio embed.FS
 
 var (
 	sexyMode     bool
 	haloMode     bool
-	lizardMode   bool
+	memeMode     bool
+	memeAIMode   bool
+	sayVoice     string
 	customPath   string
 	customFiles  []string
 	fastMode     bool
@@ -179,6 +182,15 @@ type slapTracker struct {
 	pack     *soundPack
 }
 
+// playRequest represents a request to play an MP3 audio file.
+type playRequest struct {
+	pack      *soundPack
+	path      string
+	amplitude float64
+	isAI      bool
+	aiText    string
+}
+
 func newSlapTracker(pack *soundPack, cooldown time.Duration) *slapTracker {
 	// scale maps the exponential curve so that sustained max-rate
 	// slapping (one per cooldown) reaches the final file. At steady
@@ -257,7 +269,9 @@ within a minute, the more intense the sounds become.`,
 
 	cmd.Flags().BoolVarP(&sexyMode, "sexy", "s", false, "Enable sexy mode")
 	cmd.Flags().BoolVarP(&haloMode, "halo", "H", false, "Enable halo mode")
-	cmd.Flags().BoolVarP(&lizardMode, "lizard", "l", false, "Enable lizard mode (escalating intensity)")
+	cmd.Flags().BoolVar(&memeMode, "meme", false, "Enable meme mode (plays files from audio/meme)")
+	cmd.Flags().BoolVar(&memeAIMode, "meme-ai", false, "Enable AI-generated meme one-liners (macOS 'say')")
+	cmd.Flags().StringVar(&sayVoice, "say-voice", "Alex", "Voice name for macOS 'say' (e.g. Alex, Samantha). Empty = default voice")
 	cmd.Flags().StringVarP(&customPath, "custom", "c", "", "Path to custom MP3 audio directory")
 	cmd.Flags().BoolVar(&fastMode, "fast", false, "Enable faster detection tuning (shorter cooldown, higher sensitivity)")
 	cmd.Flags().StringSliceVar(&customFiles, "custom-files", nil, "Comma-separated list of custom MP3 files")
@@ -284,14 +298,17 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 	if haloMode {
 		modeCount++
 	}
-	if lizardMode {
+	if memeMode {
+		modeCount++
+	}
+	if memeAIMode {
 		modeCount++
 	}
 	if customPath != "" || len(customFiles) > 0 {
 		modeCount++
 	}
 	if modeCount > 1 {
-		return fmt.Errorf("--sexy, --halo, --lizard, and --custom/--custom-files are mutually exclusive; pick one")
+		return fmt.Errorf("--sexy, --halo, --meme, --meme-ai, and --custom/--custom-files are mutually exclusive; pick one")
 	}
 
 	if tuning.minAmplitude < 0 || tuning.minAmplitude > 1 {
@@ -320,8 +337,12 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 		pack = &soundPack{name: "sexy", fs: sexyAudio, dir: "audio/sexy", mode: modeEscalation}
 	case haloMode:
 		pack = &soundPack{name: "halo", fs: haloAudio, dir: "audio/halo", mode: modeRandom}
-	case lizardMode:
-		pack = &soundPack{name: "lizard", fs: lizardAudio, dir: "audio/lizard", mode: modeEscalation}
+	case memeMode:
+		pack = &soundPack{name: "meme", fs: memeAudio, dir: "audio/meme", mode: modeRandom}
+	case memeAIMode:
+		// For AI mode we don't need embedded files; provide a dummy file list
+		// so the slapTracker math doesn't divide by zero.
+		pack = &soundPack{name: "meme-ai", dir: "", mode: modeRandom, files: []string{"(ai)"}}
 	default:
 		pack = &soundPack{name: "pain", fs: painAudio, dir: "audio/pain", mode: modeRandom}
 	}
@@ -376,6 +397,41 @@ func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuf
 	tracker := newSlapTracker(pack, tuning.cooldown)
 	speakerInit := false
 	det := detector.New()
+	// Playback coordination: single-slot buffer.
+	playChan := make(chan playRequest, 1)
+	var latestReq playRequest
+	var latestSet bool
+	var latestMu sync.Mutex
+
+	// Player goroutine: process play requests sequentially. After each
+	// playback, check for a stored latest request and play it next.
+	go func() {
+		for req := range playChan {
+			if req.isAI {
+				speakText(req.aiText)
+			} else {
+				playAudio(req.pack, req.path, req.amplitude, &speakerInit)
+			}
+
+			// After finishing playback, play any latest buffered request.
+			for {
+				latestMu.Lock()
+				if !latestSet {
+					latestMu.Unlock()
+					break
+				}
+				next := latestReq
+				latestSet = false
+				latestMu.Unlock()
+
+				if next.isAI {
+					speakText(next.aiText)
+				} else {
+					playAudio(next.pack, next.path, next.amplitude, &speakerInit)
+				}
+			}
+		}
+	}()
 	var lastAccelTotal uint64
 	var lastEventTime time.Time
 	var lastYell time.Time
@@ -449,6 +505,35 @@ func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuf
 
 		lastYell = now
 		num, score := tracker.record(now)
+		if memeAIMode {
+			quip := generateLocalQuip()
+			if stdioMode {
+				event := map[string]interface{}{
+					"timestamp":  now.Format(time.RFC3339Nano),
+					"slapNumber": num,
+					"amplitude":  ev.Amplitude,
+					"severity":   string(ev.Severity),
+					"quip":       quip,
+				}
+				if data, err := json.Marshal(event); err == nil {
+					fmt.Println(string(data))
+				}
+			} else {
+				fmt.Printf("slap #%d -> \"%s\"\n", num, quip)
+			}
+			req := playRequest{isAI: true, aiText: quip, amplitude: ev.Amplitude}
+			select {
+			case playChan <- req:
+				// scheduled immediately
+			default:
+				latestMu.Lock()
+				latestReq = req
+				latestSet = true
+				latestMu.Unlock()
+			}
+			continue
+		}
+
 		file := tracker.getFile(score)
 		if stdioMode {
 			event := map[string]interface{}{
@@ -464,7 +549,18 @@ func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuf
 		} else {
 			fmt.Printf("slap #%d [%s amp=%.5fg] -> %s\n", num, ev.Severity, ev.Amplitude, file)
 		}
-		go playAudio(pack, file, ev.Amplitude, &speakerInit)
+
+		req := playRequest{pack: pack, path: file, amplitude: ev.Amplitude}
+		select {
+		case playChan <- req:
+			// scheduled immediately
+		default:
+			// player busy; store this as the latest request (one-slot buffer)
+			latestMu.Lock()
+			latestReq = req
+			latestSet = true
+			latestMu.Unlock()
+		}
 	}
 }
 
@@ -564,6 +660,52 @@ func playAudio(pack *soundPack, path string, amplitude float64, speakerInit *boo
 		done <- true
 	})))
 	<-done
+}
+
+// speakText uses the macOS `say` command to speak a short line of text.
+func speakText(text string) {
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+	if len(text) > 300 {
+		text = text[:300]
+	}
+	sudoUser := os.Getenv("SUDO_USER")
+	sayArgs := []string{}
+	if sayVoice != "" {
+		sayArgs = append(sayArgs, "-v", sayVoice)
+	}
+	sayArgs = append(sayArgs, text)
+
+	var cmd *exec.Cmd
+	if os.Geteuid() == 0 && sudoUser != "" {
+		args := append([]string{"-u", sudoUser, "say"}, sayArgs...)
+		cmd = exec.Command("sudo", args...)
+	} else {
+		cmd = exec.Command("say", sayArgs...)
+	}
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "spank: say failed: %v\n", err)
+	}
+}
+
+// generateLocalQuip composes a short, family-friendly one-liner.
+func generateLocalQuip() string {
+	subjects := []string{"this laptop", "my MacBook", "the keyboard", "the trackpad", "your device", "the poor laptop"}
+	reactions := []string{"says 'ow'", "is offended", "needs a hug", "filed a complaint", "demands snacks", "wants coffee"}
+	intros := []string{"Whoa,", "Careful!", "Hey—", "Oof,", "Yikes,"}
+
+	s := subjects[rand.Intn(len(subjects))]
+	r := reactions[rand.Intn(len(reactions))]
+	i := intros[rand.Intn(len(intros))]
+
+	templates := []string{
+		"%s %s %s.",
+		"%s %s — %s.",
+		"%s %s! %s.",
+	}
+	t := templates[rand.Intn(len(templates))]
+	return strings.TrimSpace(fmt.Sprintf(t, i, s, r))
 }
 
 // stdinCommand represents a command received via stdin

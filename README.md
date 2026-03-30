@@ -50,6 +50,9 @@ sudo spank --sexy
 # Halo mode — plays Halo death sounds when slapped
 sudo spank --halo
 
+# Meme mode - plays faaaa and other meme sounds when slapped
+sudo spank --meme
+
 # Fast mode — faster polling and shorter cooldown
 sudo spank --fast
 sudo spank --sexy --fast
